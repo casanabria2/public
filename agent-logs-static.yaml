@@ -1,0 +1,1037 @@
+---
+# yamllint disable rule:line-length
+# ******************************************************************************
+# * Agent Server Configuration
+# * Docs: https://grafana.com/docs/agent/latest/configuration/server-config/
+# ******************************************************************************
+server:
+  log_level: ${AGENT_LOG_LEVEL:='info'}
+  log_format: logfmt
+
+# ******************************************************************************
+# * Logs Configuration
+# * Docs: https://grafana.com/docs/agent/latest/configuration/logs-config/
+# ******************************************************************************
+logs:
+  configs:
+    #########################################################################################################################
+    # Auto-discovery of pods logs to be scraped, the following pod annotations are supported:
+    #
+    #   # allow a pod to declare it's logs should be dropped
+    #   logs.agent.grafana.com/ingest: false
+    #
+    #   # allow a pod to override the tenant for its logs
+    #   logs.agent.grafana.com/tenant: primary
+    #
+    #   # if specified additional processing is performed to extract details based on the specified format
+    #   logs.agent.grafana.com/log-format: logfmt|opentelemetry|clf|spring-boot|log4j-json|generic-json|istio-json|spring-boot|log4j-text|log4j-json|postgres|klog
+    #
+    #   # whether or not the level should be dropped from the log message (as it is a label)
+    #   logs.agent.grafana.com/scrub-level: "true"
+    #
+    #   # whether or not the timestamp should be dropped from the log message (as it is metadata)
+    #   logs.agent.grafana.com/scrub-timestamp: "true"
+    #
+    #   # whether or not keys with null values should be dropped from json
+    #   logs.agent.grafana.com/scrub-nulls: "true"
+    #
+    #   # whether or not to inject the name of the pod to the end of the log message i.e. __pod=agent-logs-grafana-agent-jrqms
+    #   logs.agent.grafana.com/embed-pod: "true"
+    #
+    #   # whether or not debug messages should be dropped (default is true), but a pod can override this temporarily or permanently
+    #   logs.agent.grafana.com/drop-debug: "false"
+    #
+    #   # whether or not trace messages should be dropped (default is true), but a pod can override this temporarily or permanently
+    #   logs.agent.grafana.com/drop-trace: "false"
+    #
+    #   # mask SSNs in the log line
+    #   logs.agent.grafana.com/mask-ssn: "true"
+    #
+    #   # mask credit cards in the log line
+    #   logs.agent.grafana.com/mask-credit-card: "true"
+    #
+    #   # mask emails in the log line
+    #   logs.agent.grafana.com/mask-email: "true"
+    #
+    #   # mask IPv4 addresses in the log line
+    #   logs.agent.grafana.com/mask-ipv4: "true"
+    #
+    #   # mask IPv6 addresses in the log line
+    #   logs.agent.grafana.com/mask-ipv6: "true"
+    #
+    #   # mask phone numbers in the log line
+    #   logs.agent.grafana.com/mask-phone: "true"
+    #
+    #########################################################################################################################
+    # Default Scrape Configuration for the primary tenant, this looks for the annotation of
+    # logs.agent.grafana.com/tenant: primary or if the annotation is not set, the logs would also
+    # fall into this config
+    - name: primary
+      clients:
+        - &loki_endpoint
+          url: ${LOGS_PUBLISHER_URL}
+          basic_auth:
+            username: ${LOGS_PUBLISHER_TENANT_DEFAULT}
+            password: ${LOGS_PUBLISHER_TOKEN}
+          external_labels:
+            cluster: ${CLUSTER_NAME:-'primary'}
+      positions:
+        filename: /tmp/${LOGS_PUBLISHER_TENANT_DEFAULT}-positions.yaml
+      target_config:
+        sync_period: 10s
+      scrape_configs:
+        - job_name: kubernetes-pod-logs
+          kubernetes_sd_configs:
+            - role: pod
+          # relabelings are processed before pipeline stages (before the file as has been tailed)
+          relabel_configs:
+            # only keep targets who have the primary tenant set or tenant is not defined
+            - action: keep
+              source_labels: [__meta_kubernetes_pod_annotation_logs_agent_grafana_com_tenant]
+              regex: ^(primary|)$
+            # allow pods to declare their logs should not be ingested, the following annotation is supported:
+            #   logs.agent.grafana.com/ingest: false
+            - &ingest_check
+              action: drop
+              source_labels: [__meta_kubernetes_pod_annotation_logs_agent_grafana_com_ingest]
+              regex: 'false'
+            # set the __path__, this is automatically translated as a label of filename (which should be dropped)
+            # DO NOT delete this line as it is needed to tail the pod logs on the node
+            - &log_path
+              action: replace
+              separator: /
+              source_labels:
+                - __meta_kubernetes_pod_uid
+                - __meta_kubernetes_pod_container_name
+              replacement: /var/log/pods/*$1/*.log
+              target_label: __path__
+            # set the name of the pod node
+            - &pod_node_host
+              source_labels: [__meta_kubernetes_pod_node_name]
+              target_label: __host__
+            - &pod_node_instance
+              source_labels: [__host__]
+              target_label: instance
+            # add a deployment label for DaemonSets and drop the last 5 chars (hash) from the pod name
+            # example: grafana-agent-68nv9 becomes DaemonSet/grafana-agent
+            - &deployment_daemonset
+              action: replace
+              source_labels:
+                - __meta_kubernetes_pod_controller_kind
+                - __meta_kubernetes_pod_name
+              regex: ^(DaemonSet);(.*)(-[^-]{5})$
+              replacement: $1/$2
+              target_label: deployment
+            # add a deployment label for ReplicaSets and drop the last 10 chars for the ReplicaSet and last 5 chars from the pod
+            # example: grafana-58b546d457-dkq99 becomes ReplicaSet/grafana
+            - &deployment_replicaset
+              action: replace
+              source_labels:
+                - __meta_kubernetes_pod_controller_kind
+                - __meta_kubernetes_pod_name
+              regex: ^(ReplicaSet);((?:[^-\n]+-?)+)(?:-[a-f0-9]{9,10}-[^-\n]{5}|-[a-z0-9]{6,15})$
+              replacement: $1/$2
+              target_label: deployment
+            # add a deployment label for StatefulSet/CronJob and drop the last digits
+            # example: enterprise-metrics-backend-0 becomes StatefulSet/enterprise-metrics-backend
+            - &deployment_statefulset
+              action: replace
+              source_labels:
+                - __meta_kubernetes_pod_controller_kind
+                - __meta_kubernetes_pod_name
+              regex: ^(StatefulSet|CronJob);(.*)(-\d+)$
+              replacement: $1/$2
+              target_label: deployment
+            # add a deployment label for pods created from Jobs
+            - &deployment_job
+              action: replace
+              source_labels:
+                - __meta_kubernetes_pod_controller_kind
+                - __meta_kubernetes_pod_name
+              regex: ^(Job);(.*)(-\d+)$
+              replacement: $1/$2
+              target_label: deployment
+            # add a deployment label for bare pods, created outside of a controller
+            - &deployment_pod
+              action: replace
+              source_labels:
+                - __meta_kubernetes_pod_controller_kind
+                - __meta_kubernetes_pod_name
+              regex: ;(.*)
+              replacement: Pod/$1
+              target_label: deployment
+            # override the job label to namespace/pod
+            - &job
+              action: replace
+              source_labels:
+                - deployment
+                - __meta_kubernetes_namespace
+              regex: (?:.+\/)?(.+);(.+)
+              replacement: $2/$1
+              target_label: job
+            # set the namespace label
+            - &namespace
+              action: replace
+              source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            # set the pod name label
+            - &pod_name
+              action: replace
+              source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            # set the container label
+            - &container
+              action: replace
+              source_labels: [__meta_kubernetes_pod_container_name]
+              target_label: container
+            # set the app name if specified
+            - &app
+              action: replace
+              source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+              regex: (.+)
+              replacement: $1
+              target_label: app
+            # set the app component if specified
+            - &component
+              action: replace
+              source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+              regex: (.+)
+              replacement: $1
+              target_label: component
+            # make all labels on the pod available to the pipeline as labels, they are omitted before write via labelallow unless explicitly set
+            - &pod_labels
+              action: labelmap
+              regex: __meta_kubernetes_pod_label_(.+)
+            # make all annotations on the pod available to the pipeline as labels, they are omitted before write via labelallow unless explicitly set
+            - &pod_annotations
+              action: labelmap
+              regex: __meta_kubernetes_pod_annotation_(.+)
+
+          # pipeline stages processed after relabel_configs before write to loki
+          pipeline_stages: &pipeline_stages
+            # you should lead with one of the two stages docker or cri but not both
+            # the docker processing stage extracts the following k/v pairs: log, stream, time
+            # Docs: https://grafana.com/docs/loki/latest/clients/promtail/stages/docker/
+            # - docker: {}
+            # the cri processing stage extracts the following k/v pairs: log, stream, time, flags
+            # Docs: https://grafana.com/docs/loki/latest/clients/promtail/stages/cri/
+            - cri: {}
+            # set stream as a label
+            - labels:
+                stream:
+            # stream and time are removed and only the log message persisted
+            - output:
+                source: log
+            ##############################################################################
+            # Normalize the filename, the label "filename" is automatically created from
+            # discovered files in the matching path based on the __path__ label from the
+            # relabel_configs.  This has extremely high cardinality, it can be useful
+            # for a pod with multiple containers/sidecars to know where the log came from
+            # but we can greatly reduce the cardinality.
+            # Example:
+            # Filename: /var/log/pods/agents_agent-logs-grafana-agent-k8hpm_5cafa323-a7ed-4703-9220-640d3e44a5e3/config-reloader/0.log
+            # Becomes: /var/log/pods/agents/agent-logs-grafana-agent/config-reloader.log
+            ##############################################################################
+            - regex:
+                expression: ^(?P<path>\/([^\/_]+\/)+)[^\/]+\/(?P<container_folder>[^\/]+)\/\d+\.log
+                source: filename
+            - template:
+                source: normalized_filename
+                template: '{{ .path }}{{ .job }}/{{ .container_folder }}.log'
+            - labels:
+                filename: normalized_filename
+            # assign a default log-level of unknown
+            - static_labels:
+                level: unknown
+
+            ##############################################################################
+            # Log Format Processing, only the following is processed if the annotation
+            # logs.agent.grafana.com/log-format is set
+            ##############################################################################
+            - match:
+                selector: '{logs_agent_grafana_com_log_format=~".+"}'
+                stages:
+                  ##############################################################################
+                  # Log Processing for logfmt
+                  # annotation: logs.agent.grafana.com/log-format: logfmt
+                  # Docs: https://github.com/go-logfmt/logfmt/blob/main/README.md
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)logfmt"}'
+                      stages:
+                        #
+                        # parse the log line using logfmt and extract the level, timestamp and stream fields
+                        - regex:
+                            expression: (level|lvl)=(?P<level>\S+)
+                        - labels:
+                            level:
+                        # check logs.agent.grafana.com/scrub-timestamp annotation, if true remove the timestamp from the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: ((ts?|timestamp)=\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}(\.\d+)?(Z|(\+|-)\d+)?\s+)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: '((lvl|level)=[^\s]+\s)'
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for common-log (apache/nginx)
+                  # annotation: logs.agent.grafana.com/log-format: clf
+                  # Docs: https://www.w3.org/Daemon/User/Config/Logging.html#common-logfile-format
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)(apache|nginx|common-?log|clf)"}'
+                      stages:
+                        # nginx doesn't have a log level, set to info
+                        - static_labels:
+                            level: info
+                        - regex:
+                            expression: (?P<response_code>\d{3}) "(?P<request_method>\S+)
+                        - labels:
+                            response_code:
+                            request_method:
+                        # check to see if the string failed is found in the log line, if so set the level to error
+                        - match:
+                            selector: '{logs_agent_grafana_com_log_format=~"(?i)(apache|nginx|common-log|clf)"} |= " failed "'
+                            stages:
+                              - static_labels:
+                                  level: error
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (\[([^\]]+)\])
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for OpenTelemetry
+                  # annotation: logs.agent.grafana.com/log-format: open-telemetry
+                  # Docs: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/data-model.md
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)open-?telemetry"}'
+                      stages:
+                        # extract the SeverityText (level), and service.name
+                        # Docs: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/semantic_conventions/README.md#service
+                        - json:
+                            expressions:
+                              level: SeverityText
+                              service: Resource."service.name"
+                        - labels:
+                            level:
+                            service:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: ("Timestamp":"[^"]+",)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: ("SeverityText":"[^"]+",)
+                                  replace: ''
+                        # check to see if null values should be scrubbed from the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_nulls="true"}'
+                            stages:
+                              # remove any null json values
+                              - replace:
+                                  expression: (,("[^"]+":\s*null)|("[^"]+":\s*null),)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # remove the last } from the line
+                              - replace:
+                                  expression: (\}$)
+                                  replace: ''
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }},"__pod":"{{ .pod }}"}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Generic JSON
+                  # annotation: logs.agent.grafana.com/log-format: json
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)(generic-?)?json"}'
+                      stages:
+                        # extract the SeverityText (level), and service.name
+                        # Docs: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/semantic_conventions/README.md#service
+                        - json:
+                            expressions:
+                              level: level || lvl || loglevel || log_level || logLevel || log_lvl || logLvl
+                              timestamp: timestamp || timeStamp || Timestamp || ts || Ts || tS || logdate || LogDate || LOGDATE || time || Time
+                        - labels:
+                            level:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (?i)("(timestamp|ts|logdate|time)":"[^"]+",?)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: (?i)"(log)?(level|lvl)":"[^"]+",?
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # remove the last } from the line
+                              - replace:
+                                  expression: '\}$'
+                                  replace: ''
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }},"__pod":"{{ .pod }}"}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Istio
+                  # annotation: logs.agent.grafana.com/log-format: istio-json
+                  # Docs: https://istio.io/latest/docs/tasks/observability/logs/access-log/
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)istio-?json"}'
+                      stages:
+                        # not all istio logs contain a level, default to info
+                        - static_labels:
+                            level: info
+                        # extract the level, response_code, method if they exist
+                        - json:
+                            expressions:
+                              level: level
+                              response_code: response_code
+                              request_method: method
+                        - labels:
+                            level:
+                            response_code:
+                            request_method:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line, depending on the entry it can be "start_time" or "time"
+                              - replace:
+                                  expression: ("(start_)?time":"[^"]+",)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: '"level":"[^"]+",'
+                                  replace: ''
+                        # check to see if null values should be scrubbed from the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_nulls="true"}'
+                            stages:
+                              # remove any null json values
+                              - reNplace:
+                                  expression: (,("[^"]+":\s*null)|("[^"]+":\s*null),)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # remove the last } from the line
+                              - replace:
+                                  expression: '\}$'
+                                  replace: ''
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }},"__pod":"{{ .pod }}"}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Spring Boot
+                  # annotation: logs.agent.grafana.com/log-format: spring-boot
+                  # Docs: https://docs.spring.io/spring-boot/docs/2.1.13.RELEASE/reference/html/boot-features-logging.html
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)spring-?boot"}'
+                      stages:
+                        # extract values from the log line using regex
+                        - regex:
+                            expression: (?P<timestamp>\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}(\.\d+)?)\s+(?P<level>\w+)\s+(?P<trace>\[(\S*\-?),(?P<traceId>\S*),(?P<spanId>\S*)\])\s+(?P<process_id>\d+)\s+-+\s+\[\s*(?P<thread>\S+)\]\s+(?P<logger>\S+)\s+:\s+(?P<message>.+)
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                            process_id:
+                            thread:
+                            logger:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: ^(\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}(\.\d+)?(Z|(\+|-)[0-9:]+)?)\s+
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: '(ERROR|WARN|INFO|DEBUG|TRACE)\s+'
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Log4j
+                  # annotation: logs.agent.grafana.com/log-format: log4j-text OR log4-json
+                  # Docs: https://logging.apache.org/log4j/2.x/manual/layouts.html#json-template-layout
+                  #       https://github.com/logstash/log4j-jsonevent-layout
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)log4j-?json"}'
+                      stages:
+                        # extract values from the log line using regex
+                        - json:
+                            expressions:
+                              level: level
+                              thread: thread_name
+                              logger: logger_name
+                              class: class
+                              timestamp: '["@timestamp"]'
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                            thread:
+                            logger:
+                            class: class
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: ("@timestamp":\s*"[^"]+",)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: ("level":\s*"[^"]+",)
+                                  replace: ''
+                        # check to see if null values should be scrubbed from the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_nulls="true"}'
+                            stages:
+                              # remove any null json values
+                              - replace:
+                                  expression: (,("[^"]+":\s*null)|("[^"]+":\s*null),)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # remove the last } from the line
+                              - replace:
+                                  expression: '\}$'
+                                  replace: ''
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }},"__pod":"{{ .pod }}"}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)log4j(-?te?xt)?"}'
+                      stages:
+                        # extract values from the log line using regex
+                        - regex:
+                            expression: (?P<timestamp>\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}(\.\d+)?(Z|(\+|-)\d+)?)\s+(?P<level>\w+)\s+\[(?P<thread>[^]]+)\]
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                            thread:
+                            timestamp:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}(\.\d+)?(Z|(\+|-)\d+)?)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: (\[?(DEBUG|INFO|WARN|ERROR|FATAL|TRACE)\]\s*)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Postgres
+                  # annotation: logs.agent.grafana.com/log-format: postgres
+                  # Docs: https://www.postgresql.org/docs/current/runtime-config-logging.html
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)postgres(-?sql)?"}'
+                      stages:
+                        # extract values from the log line using regex
+                        - regex:
+                            expression: \[?(?P<timestamp>\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}.\d+\s+\w+)\]?\s+(\[(?P<process_id>\d+)\]\s+|.+)(?P<level>(INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC|DEBUG)\d*):\s*
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                            process_id:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (\[?\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}.\d+\s+\w+\]?)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: ((INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC|DEBUG)\d*:\s+)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+                  ##############################################################################
+                  # Log Processing for Postgres
+                  # annotation: logs.agent.grafana.com/log-format: postgres
+                  # Docs: https://www.postgresql.org/docs/current/runtime-config-logging.html
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)postgres(-?sql)?"}'
+                      stages:
+                        # extract values from the log line using regex
+                        - regex:
+                            expression: \[?(?P<timestamp>\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}.\d+\s+\w+)\]?\s+(\[(?P<process_id>\d+)\]\s+|.+)(?P<level>(INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC|DEBUG)\d*):\s*
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                            process_id:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (\[?\d{4}-\d{2}-\d{2}(T|\s+)\d{2}:\d{2}:\d{2}.\d+\s+\w+\]?)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: ((INFO|NOTICE|WARNING|ERROR|LOG|FATAL|PANIC|DEBUG)\d*:\s+)
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+                  ##############################################################################
+                  # Log Processing for klog (used by kube-state-metrics and more in kube-system)
+                  # annotation: logs.agent.grafana.com/log-format: klog
+                  # Docs: https://github.com/kubernetes/klog
+                  ##############################################################################
+                  - match:
+                      selector: '{logs_agent_grafana_com_log_format=~"(?i)klog"}'
+                      stages:
+                        # extract log level, klog uses a single letter code for the level followed by the month and day i.e. I0119
+                        - regex:
+                            expression: ((?P<level>[A-Z])[0-9])
+                        - replace:
+                            source: level
+                            expression: (I)
+                            replace: INFO
+                        - replace:
+                            source: level
+                            expression: (W)
+                            replace: WARN
+                        - replace:
+                            source: level
+                            expression: (E)
+                            replace: ERROR
+                        - replace:
+                            source: level
+                            expression: (D)
+                            replace: DEBUG
+                        # set the extracted values as labels
+                        - labels:
+                            level:
+                        # check to see if the timestamp should be scrubbed from the line
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_timestamp=~"(?i)true"}'
+                            stages:
+                              # remove timestamp from the log line
+                              - replace:
+                                  expression: (\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+)
+                                  replace: ''
+                        # check logs.agent.grafana.com/scrub-level annotation, if true remove the level from the log line (it is still a label)
+                        - match:
+                            selector: '{logs_agent_grafana_com_scrub_level=~"(?i)true"}'
+                            stages:
+                              # remove level from the log line
+                              - replace:
+                                  expression: (^(I|W|E|D))
+                                  replace: ''
+                        # check logs.agent.grafana.com/embed-pod annotation, if true embed the name of the pod to the end of the log line
+                        - match:
+                            selector: '{logs_agent_grafana_com_embed_pod=~"(?i)true"}'
+                            stages:
+                              # render a new label called log_line, and add the name of the pod to the end of the log message
+                              # knowing the pod name can be valuable for debugging, but it should not be a label in Loki due
+                              # to the high cardinality it would create.
+                              # note: .Entry is a special key that is used to reference the current line
+
+                              # append the pod, and add the } back
+                              - template:
+                                  source: log_line
+                                  template: '{{ .Entry }} __pod={{ .pod }}'
+                              # reset the output to the log_line
+                              - output:
+                                  source: log_line
+
+            ##############################################################################
+            # Final Checks / Processing
+            ##############################################################################
+            # if the level is still unknown and it matches the klog pattern then assign it, most likely something from kube-system
+            - match:
+                selector: '{level="unknown"} |~ "([IWED]\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d+)"'
+                stages:
+                  # extract log level, klog uses a single letter code for the level followed by the month and day i.e. I0119
+                  - regex:
+                      expression: ((?P<level>[A-Z])[0-9])
+                  - replace:
+                      source: level
+                      expression: (I)
+                      replace: INFO
+                  - replace:
+                      source: level
+                      expression: (W)
+                      replace: WARN
+                  - replace:
+                      source: level
+                      expression: (E)
+                      replace: ERROR
+                  - replace:
+                      source: level
+                      expression: (D)
+                      replace: DEBUG
+                  # set the extracted values as labels
+                  - labels:
+                      level:
+            # if the level is still unknown, do one last attempt at detecting it based on common capitalized levels
+            - match:
+                selector: '{level="unknown"}'
+                stages:
+                  - regex:
+                      expression: (?i)(?:"(?:level|loglevel|lvl|SeverityText)":\s*"|\s+(?:level|loglevel|lvl)="?|\s+\[?)(?P<level>(DEBUG?|INFO|WARN(ING)?|ERR(OR)?|CRITICAL|FATAL|NOTICE|TRACE))("|\s+|-|\s*\])
+                  - labels:
+                      level:
+            # check logs.agent.grafana.com/drop-trace annotation, if true or empty string drop the log line
+            - match:
+                selector: '{level=~"(?i)trace?",logs_agent_grafana_com_drop_trace!="false"}'
+                stages:
+                  - drop:
+                      source: level
+                      expression: (?i)trace
+                      drop_counter_reason: trace
+            # check logs.agent.grafana.com/drop-debug annotation, if true or empty string drop the log line
+            - match:
+                selector: '{level=~"(?i)debug?",logs_agent_grafana_com_drop_debug!="false"}'
+                stages:
+                  - drop:
+                      source: level
+                      expression: (?i)debug?
+                      drop_counter_reason: debug
+            # check logs.agent.grafana.com/mask-ssn annotation, if true the data will be masked as *SSN*salt*
+            - match:
+                selector: '{logs_agent_grafana_com_mask_ssn="true"}'
+                stages:
+                  - replace:
+                      expression: (\d{3}-\d{2}-\d{4})
+                      replace: '*SSN*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-credit-card annotation, if true the data will be masked as *credit-card*salt*
+            # Formats:
+            #   Visa: 4\d{15}
+            #   MasterCard: 5[1-5]\d{14}
+            #   American Express: 3[47]\d{13}
+            #   Discover: 6\d{15}
+            #   JCB: 3[51-55]\d{14}
+            - match:
+                selector: '{logs_agent_grafana_com_mask_credit_card="true"}'
+                stages:
+                  - replace:
+                      expression: (4\d{15}|5[1-5]\d{14}|3[47]\d{13}|6\d{15}|3[51-55]\d{14})
+                      replace: '*credit-card*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-email annotation, if true the data will be masked as *email*salt*
+
+            - replace:
+                expression: ([\w\.=-]+@[\w\.-]+\.[\w]{2,64})
+                replace: '*email*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-ipv4 annotation, if true the data will be masked as *ipv4*salt*
+            - match:
+                selector: '{logs_agent_grafana_com_mask_ipv4="true"}'
+                stages:
+                  - replace:
+                      expression: ((\b25[0-5]|\b2[0-4][0-9]|\b[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3})
+                      replace: '*ip4*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-ipv6 annotation, if true the data will be masked as *ipv6*salt*
+            - match:
+                selector: '{logs_agent_grafana_com_mask_ipv6="true"}'
+                stages:
+                  - replace:
+                      expression: (([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))
+                      replace: '*ip6*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-phone annotation, if true the data will be masked as *phone*salt*
+            - match:
+                selector: '{logs_agent_grafana_com_mask_phone="true"}'
+                stages:
+                  - replace:
+                      expression: ([\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6})
+                      replace: '*phone*{{ .Value | Hash "salt" }}*'
+            # check logs.agent.grafana.com/mask-name annotation, if true the data will be masked as *phone*salt*
+            - match:
+                selector: '{logs_agent_grafana_com_mask_name="true"}'
+                stages:
+                  - replace:
+                      expression: (?i)"(?:fname|first_?name|mname|middle_?name|lname|last_?name)"\s*:\s*"(?P<value>[^"]+)"
+                      replace: '*masked*{{ .Value | Hash "salt" }}*'
+
+            ##############################################################################
+            # !!!IMPORTANT!!!
+            # DO NOT REMOVE
+            # As all of the pod labels and annotations we transformed into labels in the above relabel_config to make
+            # them available to the pipeline processing we need to ensure they are not automatically created in Loki.
+            # This would result in an extremely high number of labels and values severely impacting query performance.
+            # Not every log has to contain these labels, but this list should reflect the set of labels that you want
+            # to explicitly allow.
+            # !!!IMPORTANT!!!
+            ##############################################################################
+            - labelallow:
+                - cluster
+                - component
+                - deployment
+                - filename
+                - instance
+                - job
+                - level
+                - namespace
+                - region
+                - request_method
+                - response_code
+                - service
+
+    # this is a tenant specific scrape job that looks for the annotation of
+    # logs.agent.grafana.com/tenant: ops , this would only match and process logs
+    # with this annotation explicitly set.  you would repeat this for each tenant that
+    # you want to support
+    - name: ops
+      clients:
+        - <<: *loki_endpoint
+          basic_auth:
+            username: ${LOGS_PUBLISHER_TENANT_OPS}
+      positions:
+        filename: /tmp/${LOGS_PUBLISHER_TENANT_OPS}-positions.yaml
+      target_config:
+        sync_period: 10s
+      scrape_configs:
+        - job_name: kubernetes-pod-logs
+          kubernetes_sd_configs:
+            - role: pod
+          # relabelings are processed before pipeline stages (before the file as has been tailed)
+          relabel_configs:
+            - action: keep
+              source_labels: [__meta_kubernetes_pod_annotation_logs_agent_grafana_com_tenant]
+              regex: ^(ops)$
+            - *ingest_check
+            - *log_path
+            - *pod_node_host
+            - *pod_node_instance
+            - *deployment_daemonset
+            - *deployment_replicaset
+            - *deployment_statefulset
+            - *deployment_job
+            - *deployment_pod
+            - *job
+            - *namespace
+            - *pod_name
+            - *container
+            - *app
+            - *component
+            - *pod_labels
+            - *pod_annotations
+          pipeline_stages:
+            *pipeline_stages
+
+# ******************************************************************************
+# * Metrics Configuration
+# * Docs: https://grafana.com/docs/agent/latest/configuration/metrics-config/
+# ******************************************************************************
+metrics:
+  wal_directory: /tmp/grafana-agent-wal
+  global:
+    scrape_interval: 60s
+    external_labels:
+      cluster: ${CLUSTER_NAME:-'primary'}
+  configs:
+    - name: integrations
+      remote_write:
+        - url: ${SYSTEM_METRICS_URL:-"$PRIMARY_METRICS_URL"}
+          basic_auth:
+            username: ${SYSTEM_METRICS_TENANT:-"$PRIMARY_METRICS_TENANT"}
+            password: ${SYSTEM_METRICS_TOKEN:-"$PRIMARY_METRICS_TOKEN"}
+
+# ******************************************************************************
+# * Integrations Configuration
+# * Docs: https://grafana.com/docs/agent/latest/configuration/integrations/
+# ******************************************************************************
+integrations:
+  prometheus_remote_write:
+    - url: ${SYSTEM_METRICS_URL:-"$PRIMARY_METRICS_URL"}
+      basic_auth:
+        username: ${SYSTEM_METRICS_TENANT:-"$PRIMARY_METRICS_TENANT"}
+        password: ${SYSTEM_METRICS_TOKEN:-"$PRIMARY_METRICS_TOKEN"}
